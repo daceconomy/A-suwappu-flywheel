@@ -6,6 +6,9 @@ import { scanYield } from "./strategies/yield.js";
 import { executeDCA, getFearIndex, fearMultiplier } from "./strategies/dca.js";
 import { scanArb } from "./strategies/arb.js";
 import { scanPredictions } from "./strategies/predict.js";
+import { loadState, saveState, recordTrade } from "./brain/state.js";
+import { backfillRewards } from "./brain/reward.js";
+import { adaptParameters, logAgentState } from "./brain/adapt.js";
 
 function getClient() {
   return createClient({ apiKey: requireEnv("SUWAPPU_API_KEY") });
@@ -161,51 +164,116 @@ program.command("watch").description("Continuously scan for opportunities")
     }
   });
 
-// ── Run All ──
-program.command("run").description("Run all enabled strategies once")
+// ── Run All (V2 — Self-Improving) ──
+program.command("run").description("Run all strategies with self-improving brain")
   .option("--execute", "execute DCA trades (default: scan only)")
   .option("--json", "JSON output")
   .action(async (opts) => {
     const client = getClient();
     const dryRun = !opts.execute;
 
+    // 0. Load persistent brain state
+    const state = loadState();
+
     if (!opts.json) {
       console.log("╔══════════════════════════════════════════╗");
-      console.log("║       SUWAPPU FLYWHEEL — RUN ALL        ║");
+      console.log("║    SUWAPPU FLYWHEEL V2 — SELF-IMPROVING ║");
       console.log("╚══════════════════════════════════════════╝");
-      if (dryRun) console.log("  Mode: DRY RUN (no trades executed)\n");
+      if (dryRun) console.log("  Mode: SCAN ONLY (add --execute to trade)\n");
+      else console.log("  Mode: LIVE EXECUTION\n");
     }
 
     try {
-      // 1. Status
+      // 1. Backfill rewards for previous trades
+      const apiKey = requireEnv("SUWAPPU_API_KEY");
+      const getPrice = async (token: string) => {
+        const res = await fetch(`https://api.suwappu.bot/v1/agent/prices?symbols=${token}`, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+        });
+        const data = await res.json() as { prices?: Record<string, { usd: number }> };
+        return data.prices?.[token]?.usd ?? 0;
+      };
+      const scored = await backfillRewards(state, getPrice);
+      if (scored > 0 && !opts.json) log("brain", `Scored ${scored} previous trade(s)`);
+
+      // 2. Adapt parameters based on trade history
+      const adaptation = adaptParameters(state);
+      if (!opts.json && state.trades.length >= 3) {
+        log("brain", `Adaptation: ${adaptation.reason}`);
+        logAgentState(state);
+      }
+
+      // 3. Observe market
       const fear = await getFearIndex();
       if (!opts.json) log("run", `Fear & Greed: ${fear.value}/100 (${fear.classification})`);
 
-      // 2. Yield scan
+      // 4. Yield scan
       if (!opts.json) console.log("\n── YIELD ROTATION ──");
       await scanYield(client, { chain: 8453, top: 5, json: opts.json });
 
-      // 3. DCA
-      if (!opts.json) console.log("\n── DCA ──");
-      const mult = fearMultiplier(fear.value);
-      const dcaAmount = String(Math.round(5 * mult));
-      if (!opts.json) log("dca", `Fear multiplier: ${mult}x → buying ${dcaAmount} USDC of ETH`);
-      await executeDCA(client, { token: "ETH", amount: dcaAmount, chain: "base", dryRun, json: opts.json });
+      // 5. DCA with adaptive sizing
+      if (!opts.json) console.log("\n── DCA (ADAPTIVE) ──");
+      const fearMult = fearMultiplier(fear.value);
+      const brainMult = state.adjustments.dcaAmountMultiplier;
+      const effectiveAmount = Math.round(5 * fearMult * brainMult);
 
-      // 4. Arb scan
-      if (!opts.json) console.log("\n── ARB SCANNER ──");
-      await scanArb(client, { tokens: ["ETH", "SOL"], chains: ["base", "arbitrum", "optimism", "ethereum"], minSpread: 0.1, json: opts.json });
+      if (brainMult === 0) {
+        if (!opts.json) log("dca", "⚠️  DCA PAUSED by drawdown circuit breaker");
+      } else {
+        if (!opts.json) log("dca", `Fear: ${fearMult}x | Brain: ${brainMult.toFixed(2)}x | Amount: ${effectiveAmount} USDC`);
+        const dcaResult = await executeDCA(client, {
+          token: "ETH",
+          amount: String(effectiveAmount),
+          chain: "base",
+          dryRun,
+          json: opts.json,
+        });
 
-      // 5. Prediction scout
+        // Record trade in brain state
+        if (dcaResult.executed || dryRun) {
+          const price = dcaResult.price;
+          recordTrade(state, {
+            timestamp: new Date().toISOString(),
+            strategy: "dca",
+            token: "ETH",
+            chain: "base",
+            amountIn: effectiveAmount,
+            amountOut: parseFloat(dcaResult.toAmount || "0"),
+            priceAtEntry: price,
+            fearIndex: fear.value,
+          });
+        }
+      }
+
+      // 6. Arb scan with adaptive threshold
+      if (!opts.json) console.log("\n── ARB SCANNER (ADAPTIVE) ──");
+      const minSpread = state.adjustments.minArbSpread;
+      if (!opts.json) log("arb", `Learned min spread: ${minSpread.toFixed(2)}%`);
+      await scanArb(client, {
+        tokens: ["ETH", "SOL"],
+        chains: ["base", "arbitrum", "optimism", "ethereum"],
+        minSpread,
+        json: opts.json,
+      });
+
+      // 7. Prediction scout
       if (!opts.json) console.log("\n── PREDICTION SCOUT ──");
       await scanPredictions(client, { top: 5, json: opts.json });
 
+      // 8. Save brain state
+      saveState(state);
+
       if (!opts.json) {
-        console.log("\n── SUMMARY ──");
-        log("run", "All strategies scanned. Review above for opportunities.");
+        console.log("\n── BRAIN STATUS ──");
+        log("brain", `Trades recorded: ${state.trades.length}`);
+        log("brain", `DCA multiplier: ${state.adjustments.dcaAmountMultiplier.toFixed(2)}x`);
+        log("brain", `Arb threshold: ${state.adjustments.minArbSpread.toFixed(2)}%`);
+        log("brain", `State saved to ~/.suwappu-flywheel/state.json`);
         if (dryRun) log("run", "Add --execute to enable DCA trades.");
       }
     } catch (e: any) {
+      // Save state even on error
+      saveState(state);
       console.error(`Error: ${e.message}`);
       process.exit(1);
     }
