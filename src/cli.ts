@@ -67,6 +67,12 @@ program.command("dca").description("Execute a DCA buy (or dry-run)")
       const dryRun = !opts.execute;
       let amount = opts.amount;
 
+      const maxTradeUsd = parseFloat(process.env.SUWAPPU_MAX_TRADE_USD || '1000');
+      if (parseFloat(amount) > maxTradeUsd) {
+        console.error(`Error: amount ${amount} exceeds max allowed ${maxTradeUsd}. Set SUWAPPU_MAX_TRADE_USD to override.`);
+        process.exit(1);
+      }
+
       if (opts.fearAdjust) {
         const fear = await getFearIndex();
         const mult = fearMultiplier(fear.value);
